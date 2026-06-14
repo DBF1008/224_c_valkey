@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(timeout 20 git ls-remote https://github.com/valkey-io/valkey.git 'refs/tags/8*')"
+    ]
+  }
+}
