@@ -914,6 +914,189 @@ start_server {tags {"tracking network logreqres:skip"}} {
         assert_equal {PONG} [$rd read]
     }
 
+    # ====================================================================
+    # Regression tests: tracking + MULTI/EXEC + scripts dedup & alignment
+    # ====================================================================
+
+    test {Duplicate invalidation is deduplicated in MULTI/EXEC} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET key1{t} 1
+        r GET key1{t}
+        # Inside EXEC: SET removes key1 from tracking, GET re-registers it,
+        # SET defers a second invalidation. Should be deduped to one.
+        r MULTI
+        r SET key1{t} 2
+        r GET key1{t}
+        r SET key1{t} 3
+        set res [r EXEC]
+        assert_equal $res {OK 2 OK}
+        # Should receive exactly ONE invalidation for key1{t}
+        assert_equal {invalidate key1{t}} [r read]
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {Duplicate invalidation is deduplicated in Lua script} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET key1{t} 1
+        r GET key1{t}
+        # Script: SET removes key1 from tracking table. GET inside script
+        # does NOT re-register (trackingRememberKeys skips script context).
+        # Second SET finds nothing in table. No duplicate.
+        r EVAL "redis.call('SET', 'key1{t}', '2'); redis.call('GET', 'key1{t}'); redis.call('SET', 'key1{t}', '3'); return 'OK'" 1 key1{t}
+        assert_equal {invalidate key1{t}} [r read]
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {FLUSHDB in EXEC supersedes pending key invalidations} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET a{t} 1
+        r GET a{t}
+        r MULTI
+        r SET a{t} 2
+        r FLUSHDB
+        set res [r EXEC]
+        # Should receive only the NULL (flush-all) invalidation, not key + NULL
+        set inv [r read]
+        assert_equal {invalidate {}} $inv
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {Multiple keys deduplicated in EXEC with mixed operations} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r MSET key1{t} 1 key2{t} 2
+        r MGET key1{t} key2{t}
+        r MULTI
+        r SET key1{t} 10
+        r GET key1{t}
+        r SET key1{t} 20
+        r SET key2{t} 30
+        set res [r EXEC]
+        assert_equal $res {OK 10 OK OK}
+        # Collect all invalidation messages — should be exactly 2 (one per key)
+        set inv1 [r read]
+        set inv2 [r read]
+        set keys [lsort [list [lindex $inv1 1] [lindex $inv2 1]]]
+        assert_equal $keys {key1{t} key2{t}}
+        # No more invalidation messages pending
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {Cross-client tracking invalidation during EXEC} {
+        clean_all
+        r CLIENT TRACKING on REDIRECT $redir_id
+        $rd_sg SET key1{t} 1
+        r GET key1{t}
+        # Another client modifies keys inside EXEC
+        $rd_sg MULTI
+        $rd_sg SET key1{t} 2
+        $rd_sg SET key2{t} 3
+        $rd_sg EXEC
+        # Client r should receive invalidation for key1{t} (the tracked key)
+        set keys [lindex [$rd_redirection read] 2]
+        assert {[lsearch -exact $keys "key1{t}"] >= 0}
+    }
+
+    test {Read-after-write in EXEC re-registers key for future tracking} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET key1{t} 1
+        r GET key1{t}
+        r MULTI
+        r SET key1{t} 2
+        r GET key1{t}
+        set res [r EXEC]
+        assert_equal $res {OK 2}
+        # Consume the invalidation from the EXEC
+        r read
+        # key1{t} should still be tracked (re-registered by GET inside EXEC)
+        $rd_sg SET key1{t} 3
+        assert_equal {invalidate key1{t}} [r read]
+    }
+
+    test {FLUSHDB in Lua script supersedes pending key invalidations} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET key1{t} 1
+        r GET key1{t}
+        # Script: SET triggers invalidation, FLUSHDB supersedes it
+        r EVAL "redis.call('SET', 'key1{t}', '2'); redis.call('FLUSHDB'); return 'OK'" 1 key1{t}
+        # Should receive only NULL invalidation
+        set inv [r read]
+        assert_equal {invalidate {}} $inv
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {Pipeline batch writes generate correct invalidations} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        $rd_sg SET key1{t} 1
+        $rd_sg SET key2{t} 2
+        r GET key1{t}
+        r GET key2{t}
+        # Pipeline (non-transaction): each SET is flushed independently
+        r SET key1{t} 10
+        assert_equal {invalidate key1{t}} [r read]
+        r SET key2{t} 20
+        assert_equal {invalidate key2{t}} [r read]
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {Multiple modifications of same key without reads in EXEC} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET key1{t} 1
+        r GET key1{t}
+        # Multiple SETs without intervening reads: only first generates pending
+        r MULTI
+        r SET key1{t} 2
+        r SET key1{t} 3
+        r SET key1{t} 4
+        set res [r EXEC]
+        assert_equal $res {OK OK OK}
+        # Exactly ONE invalidation
+        assert_equal {invalidate key1{t}} [r read]
+        r PING
+        assert_equal {PONG} [r read]
+    }
+
+    test {Read-after-write in script re-registers key for future tracking} {
+        clean_all
+        r HELLO 3
+        r CLIENT TRACKING on
+        r SET key1{t} 1
+        r GET key1{t}
+        # Script: SET removes from tracking. GET inside script does NOT
+        # re-register (script context). But the key is still removed
+        # from tracking table by the SET.
+        r EVAL "redis.call('SET', 'key1{t}', '2'); redis.call('GET', 'key1{t}'); return 'OK'" 1 key1{t}
+        # Consume the invalidation from the script
+        assert_equal {invalidate key1{t}} [r read]
+        # Key was removed from tracking by SET. Re-register it explicitly.
+        r GET key1{t}
+        # Now another client modifies it
+        $rd_sg SET key1{t} 3
+        # Should receive invalidation (proves explicit re-registration works)
+        assert_equal {invalidate key1{t}} [r read]
+    }
+
     $rd_redirection close
     $rd_sg close
     $rd close

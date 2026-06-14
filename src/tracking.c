@@ -433,22 +433,59 @@ void trackingHandlePendingKeyInvalidations(void) {
     listNode *ln;
     listIter li;
 
+    /* First pass: check for NULL (flush-all) entries and collect unique
+     * keys for deduplication. When the same key is modified, read, and
+     * modified again within a single EXEC or script, it can appear multiple
+     * times in the pending list. We send only one invalidation per key.
+     * A NULL entry (from FLUSHDB/FLUSHALL) supersedes all specific keys. */
+    int has_null_invalidation = 0;
+    rax *unique_keys = raxNew();
+
     listRewind(server.tracking_pending_keys, &li);
     while ((ln = listNext(&li)) != NULL) {
         robj *key = listNodeValue(ln);
-        /* current_client maybe freed, so we need to send invalidation
-         * message only when current_client is still alive */
-        if (server.current_client != NULL) {
-            if (key != NULL) {
-                sendTrackingMessage(server.current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
-            } else {
-                sendTrackingMessage(server.current_client, objectGetVal(shared.null[server.current_client->resp]),
-                                    sdslen(objectGetVal(shared.null[server.current_client->resp])), 1);
-            }
+        if (key == NULL) {
+            has_null_invalidation = 1;
+        } else {
+            sds keyname = objectGetVal(key);
+            /* raxTryInsert silently ignores duplicates, giving us dedup.
+             * The robj pointer is borrowed from the pending list; refcount
+             * is managed in the cleanup pass below. */
+            raxTryInsert(unique_keys, (unsigned char *)keyname, sdslen(keyname), key, NULL);
         }
+    }
+
+    /* Send the deduplicated invalidation messages to current_client.
+     * current_client may have been freed, so check before sending. */
+    if (server.current_client != NULL) {
+        if (has_null_invalidation) {
+            /* A flush command supersedes all specific key invalidations:
+             * send a single RESP NULL meaning "all keys are invalid". */
+            sendTrackingMessage(server.current_client, objectGetVal(shared.null[server.current_client->resp]),
+                                sdslen(objectGetVal(shared.null[server.current_client->resp])), 1);
+        } else {
+            /* Send one invalidation per unique key, in sorted order. */
+            raxIterator ri;
+            raxStart(&ri, unique_keys);
+            raxSeek(&ri, "^", NULL, 0);
+            while (raxNext(&ri)) {
+                robj *key = ri.data;
+                sendTrackingMessage(server.current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
+            }
+            raxStop(&ri);
+        }
+    }
+
+    /* Cleanup: decrement refcounts for all entries in the pending list.
+     * Each robj was incrRefCount'd when added to the list; we must
+     * decrRefCount it exactly once regardless of dedup outcome. */
+    listRewind(server.tracking_pending_keys, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        robj *key = listNodeValue(ln);
         if (key != NULL) decrRefCount(key);
     }
     listEmpty(server.tracking_pending_keys);
+    raxFree(unique_keys);
 }
 
 /* This function is called when one or all of the databases are
