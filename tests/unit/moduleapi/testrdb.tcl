@@ -90,6 +90,100 @@ tags "modules" {
     }
     }
 
+    # The tests above cover pure-RDB recovery (debug reload / save+restart).
+    # The tests below cover AOF-rewrite and hybrid (RDB-preamble BASE + INCR)
+    # recovery, asserting that module aux state is applied exactly once and that
+    # the BEFORE_RDB/AFTER_RDB ordering relative to the keyspace is preserved on
+    # these paths too (so a module never sees a half-loaded dataset and the same
+    # aux is never applied twice across base + incremental files).
+
+    test {modules aux is applied exactly once after AOF rewrite} {
+        set server_path [tmpdir "server.module-testrdb-aof"]
+        # 14 == 1110 - aux_save before and after key space, without data (counts loads)
+        start_server [list overrides [list loadmodule "$testmodule 14" "dir" $server_path "appendonly" "yes"] keep_persistence true] {
+            r config set save ""
+            r config set auto-aof-rewrite-percentage 0
+            waitForBgrewriteaof r
+            r set x 1
+            r bgrewriteaof
+            waitForBgrewriteaof r
+        }
+        start_server [list overrides [list loadmodule "$testmodule 14" "dir" $server_path "appendonly" "yes"]] {
+            # Loaded once from the AOF base; aux_load must be called exactly twice (before + after).
+            assert_equal {1} [r get x]
+            assert_equal {2} [r testrdb.get.n_aux_load_called]
+        }
+    }
+
+    foreach test_case {6 7} {
+    # 6 == 0110 - aux_save before and after key space with data
+    # 7 == 0111 - aux_save2 before and after key space with data
+    test {modules persist globals before and after across AOF rewrite} {
+        set server_path [tmpdir "server.module-testrdb-aof"]
+        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path "appendonly" "yes"] keep_persistence true] {
+            r config set save ""
+            r config set auto-aof-rewrite-percentage 0
+            waitForBgrewriteaof r
+            r testrdb.set.before global1
+            r testrdb.set.after global2
+            r testrdb.set.key mkey mval
+            # Globals are only persisted through aux on a (re)write of the base.
+            r bgrewriteaof
+            waitForBgrewriteaof r
+        }
+        start_server [list overrides [list loadmodule "$testmodule $test_case" "dir" $server_path "appendonly" "yes"]] {
+            assert_equal "global1" [r testrdb.get.before]
+            assert_equal "global2" [r testrdb.get.after]
+            assert_equal "mval" [r testrdb.get.key mkey]
+        }
+    }
+    }
+
+    test {modules aux is applied exactly once across hybrid base+incr AOF} {
+        set server_path [tmpdir "server.module-testrdb-aof"]
+        # 14 == 1110 - aux_save before and after key space, without data (counts loads)
+        start_server [list overrides [list loadmodule "$testmodule 14" "dir" $server_path "appendonly" "yes"] keep_persistence true] {
+            r config set save ""
+            r config set auto-aof-rewrite-percentage 0
+            waitForBgrewriteaof r
+            r set x1 1
+            r bgrewriteaof
+            waitForBgrewriteaof r
+            # This write lands in the INCR file, after the RDB-preamble base.
+            r set x2 2
+        }
+        start_server [list overrides [list loadmodule "$testmodule 14" "dir" $server_path "appendonly" "yes"]] {
+            assert_equal {1} [r get x1]
+            assert_equal {2} [r get x2]
+            # The base carries 2 aux records; the INCR commands carry none, so the
+            # count must stay 2 (it would be 4+ if aux were re-applied for the INCR).
+            assert_equal {2} [r testrdb.get.n_aux_load_called]
+        }
+    }
+
+    test {modules globals and keyspace survive hybrid base+incr AOF} {
+        set server_path [tmpdir "server.module-testrdb-aof"]
+        # 6 == 0110 - aux_save before and after key space with data
+        start_server [list overrides [list loadmodule "$testmodule 6" "dir" $server_path "appendonly" "yes"] keep_persistence true] {
+            r config set save ""
+            r config set auto-aof-rewrite-percentage 0
+            waitForBgrewriteaof r
+            r testrdb.set.key mkey mval
+            r testrdb.set.before global1
+            r testrdb.set.after global2
+            r bgrewriteaof
+            waitForBgrewriteaof r
+            # Plain key written after the base -> lands in the INCR file.
+            r set incrkey incrval
+        }
+        start_server [list overrides [list loadmodule "$testmodule 6" "dir" $server_path "appendonly" "yes"]] {
+            assert_equal "mval" [r testrdb.get.key mkey]
+            assert_equal "incrval" [r get incrkey]
+            assert_equal "global1" [r testrdb.get.before]
+            assert_equal "global2" [r testrdb.get.after]
+        }
+    }
+
     test {Verify module options info} {
         start_server [list overrides [list loadmodule "$testmodule"]] {
             assert_match "*\[handle-io-errors|handle-repl-async-load\]*" [r info modules]
