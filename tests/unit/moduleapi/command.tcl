@@ -162,4 +162,96 @@ start_server {tags {"modules"}} {
     }
 }
 
+set aclcheckmodule [file normalize tests/modules/aclcheck.so]
+
+start_server {tags {"modules"}} {
+    test {ACL recompute: category-granted user gains module command after load} {
+        # Grant the @write category to a user BEFORE the providing module is
+        # loaded. The command does not exist yet, so the user's command bitmap
+        # has no bit for it. When the module loads, the per-user command bits
+        # must be recomputed from the stored ACL rules so that the new
+        # write-category command becomes executable. If that invalidation is
+        # missing, the permission decision stays stale and the user is wrongly
+        # denied with NOPERM.
+        r ACL SETUSER catwrite on >pw ~* -@all +@write
+        r AUTH catwrite pw
+        assert_error "*unknown command*" {r aclcheck.module.command.aclcategories.write}
+        r AUTH default ""
+
+        r module load $aclcheckmodule
+
+        # Precondition: the new command really is in the @write category.
+        assert {[lsearch -exact [r ACL CAT write] aclcheck.module.command.aclcategories.write] >= 0}
+
+        # The @write user must now be permitted to run the freshly added command.
+        r AUTH catwrite pw
+        assert_equal OK [r aclcheck.module.command.aclcategories.write]
+        r AUTH default ""
+    }
+
+    test {ACL recompute: read-only-category user is denied a write-category module command} {
+        # A user granted only @read must not be able to run a write-category
+        # command, even one that was added at runtime by a module.
+        r ACL SETUSER catread on >pw ~* -@all +@read
+        r AUTH catread pw
+        assert_error "*NOPERM*" {r aclcheck.module.command.aclcategories.write}
+        r AUTH default ""
+    }
+
+    test {ACL recompute: explicit per-command deny of a module command is enforced} {
+        # +@all sets the all-commands fast path; an explicit -<command> must
+        # still carve out the single command and be honored immediately.
+        r ACL SETUSER catdeny on >pw ~* +@all -aclcheck.module.command.aclcategories.write
+        r AUTH catdeny pw
+        assert_error "*NOPERM*" {r aclcheck.module.command.aclcategories.write}
+        r AUTH default ""
+    }
+}
+
+start_server {tags {"modules"}} {
+    test {ACL SETUSER updates take effect immediately (no stale allow/deny)} {
+        # alice may only GET initially.
+        r ACL SETUSER alice on >pw ~* -@all +get
+        r AUTH alice pw
+        assert_equal {} [r get nope]
+        assert_error "*NOPERM*set*" {r set k v}
+        r AUTH default ""
+
+        # Granting SET must be visible on alice's next command (no stale deny).
+        r ACL SETUSER alice +set
+        r AUTH alice pw
+        assert_equal OK [r set k v]
+        assert_equal v [r get k]
+        r AUTH default ""
+
+        # Revoking GET must be visible immediately (no stale allow).
+        r ACL SETUSER alice -get
+        r AUTH alice pw
+        assert_error "*NOPERM*get*" {r get k}
+        assert_equal OK [r set k v2]
+        r AUTH default ""
+    }
+}
+
+start_server {tags {"modules"} overrides {rename-command {GET VALKEYGET}}} {
+    test {rename-command: renamed command is usable, old name is gone, COMMAND stays consistent} {
+        # The command is reachable under its new name only.
+        r set k v
+        assert_equal v [r VALKEYGET k]
+        assert_error "*unknown command*" {r GET k}
+
+        # The cached COMMAND response must be self-consistent across calls even
+        # when the command table was altered by rename-command at startup.
+        assert_equal [llength [r command]] [llength [r command]]
+        assert {[r command count] > 100}
+
+        # COMMAND INFO of the new name resolves; the old name does not.
+        set info [r command info VALKEYGET]
+        assert_equal [llength $info] 1
+        assert {[lindex $info 0] ne {}}
+        set oldinfo [r command info GET]
+        assert_equal [lindex $oldinfo 0] {}
+    }
+}
+
 
