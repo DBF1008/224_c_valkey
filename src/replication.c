@@ -733,12 +733,44 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
     decrRefCount(cmdobj);
 }
 
+/* Return 1 if a partial resynchronization starting at 'offset' can be served
+ * from the current replication backlog, 0 otherwise.
+ *
+ * This is the single source of truth for the partial-resync boundary, shared
+ * by primaryTryPartialResynchronization() (the accept/reject decision) and
+ * addReplyReplicationBacklog() (the data serving path), so the two can never
+ * disagree about what the backlog can serve.
+ *
+ * The accepted range is inclusive on both ends:
+ *
+ *     [repl_backlog->offset, repl_backlog->offset + repl_backlog->histlen]
+ *
+ * The lower bound is the offset of the first byte still held in the backlog.
+ * The upper bound is inclusive because a replica that is fully caught up asks
+ * for the next byte it expects, i.e. primary_repl_offset + 1, which equals
+ * 'repl_backlog->offset + repl_backlog->histlen'; such a request is a valid
+ * zero-byte partial resync and must be accepted. */
+static int replBacklogContainsOffset(long long offset) {
+    if (server.repl_backlog == NULL) return 0;
+    return offset >= server.repl_backlog->offset &&
+           offset <= server.repl_backlog->offset + server.repl_backlog->histlen;
+}
+
 /* Feed the replica 'c' with the replication backlog starting from the
  * specified 'offset' up to the end of the backlog. */
 long long addReplyReplicationBacklog(client *c, long long offset) {
     long long skip;
 
     serverLog(LL_DEBUG, "[PSYNC] Replica request offset: %lld", offset);
+
+    /* The serve path must never be asked for an offset the backlog can't
+     * provide: doing so would either select a block before the requested
+     * offset (producing a stream discontinuous with the backlog) or run past
+     * the end. The caller gates this with replBacklogContainsOffset(); we
+     * assert the same invariant here so the decision and the serve path stay
+     * consistent and any future caller that forgets fails loudly instead of
+     * silently corrupting the replica's replication stream. */
+    serverAssert(replBacklogContainsOffset(offset));
 
     if (server.repl_backlog->histlen == 0) {
         serverLog(LL_DEBUG, "[PSYNC] Backlog history len is zero");
@@ -886,9 +918,10 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
         goto need_full_resync;
     }
 
-    /* We still have the data our replica is asking for? */
-    if (!server.repl_backlog || psync_offset < server.repl_backlog->offset ||
-        psync_offset > (server.repl_backlog->offset + server.repl_backlog->histlen)) {
+    /* We still have the data our replica is asking for? Use the shared
+     * boundary check so this accept/reject decision matches exactly what
+     * addReplyReplicationBacklog() is able to serve below. */
+    if (!replBacklogContainsOffset(psync_offset)) {
         if (!server.repl_backlog) {
             serverLog(LL_NOTICE,
                       "Unable to partial resync with replica %s for lack of backlog (Replica request was: %s:%lld).",
