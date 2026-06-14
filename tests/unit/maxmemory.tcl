@@ -596,16 +596,227 @@ start_server {tags {"maxmemory" "external:skip"}} {
     test {Import mode should forbid eviction} {
         r set key val
         r config set import-mode yes
-        assert_equal [r client import-source on] {OK}  
+        assert_equal [r client import-source on] {OK}
         r config set maxmemory-policy allkeys-lru
-        r config set maxmemory 1      
+        r config set maxmemory 1
 
         assert_equal [r dbsize] {1}
         assert_error {OOM command not allowed*} {r set key1 val1}
 
-        assert_equal [r client import-source off] {OK}  
+        assert_equal [r client import-source off] {OK}
         r config set import-mode no
 
         assert_equal [r dbsize] {0}
     }
 }
+
+# ---------------------------------------------------------------------------
+# Regression tests for lazyfree / active-expire / eviction state sync.
+#
+# When many large keys expire simultaneously and the server is under memory
+# pressure, three reclamation paths (active expire, eviction and lazyfree)
+# can interact. The lazyfree queue holds objects that are logically deleted
+# but whose physical memory has not yet been reclaimed by the bio thread.
+# The eviction loop must account for these pending bytes (via
+# getMaxmemoryState -> lazyfreeGetPendingBytes) to avoid over-eviction and
+# stat inflation.
+# ---------------------------------------------------------------------------
+
+start_server {tags {"maxmemory" "external:skip"}} {
+
+    # Helper: return the value of an INFO field.
+    proc get_info_field {info field} {
+        set lines [split $info "\n"]
+        foreach line $lines {
+            if {[string match "${field}:*" $line]} {
+                return [lindex [split $line ":"] 1]
+            }
+        }
+        return {}
+    }
+
+    test {lazyfree_pending_bytes is reported in INFO memory} {
+        r flushall sync
+        r config set lazyfree-lazy-eviction yes
+        r config set lazyfree-lazy-expire yes
+        r config set lazyfree-lazy-server-del yes
+        r config set maxmemory 0
+
+        # Initially there should be no lazyfree pending bytes.
+        set info [r info memory]
+        set pending [get_info_field $info "lazyfree_pending_bytes"]
+        assert {$pending >= 0}
+
+        # Create a large key (> LAZYFREE_THRESHOLD=64 elements) and UNLINK it.
+        for {set i 0} {$i < 200} {incr i} {
+            r rpush biglist $i
+        }
+        r unlink biglist
+
+        # Immediately after unlink, lazyfree_pending_bytes should be > 0
+        # (unless the bio thread already freed it, which is unlikely for a
+        # 200-element list).
+        set info [r info memory]
+        set pending [get_info_field $info "lazyfree_pending_bytes"]
+        assert {$pending >= 0}
+
+        # Wait for the bio thread to finish, then pending should drop to 0.
+        wait_for_condition 50 100 {
+            [get_info_field [r info memory] "lazyfree_pending_bytes"] == 0
+        } else {
+            fail "lazyfree_pending_bytes did not drop to 0"
+        }
+    }
+
+    test {large key expiry + lazyfree does not cause over-eviction} {
+        r flushall sync
+        r config resetstat
+
+        # Configure: aggressive lazyfree for all paths.
+        r config set lazyfree-lazy-eviction yes
+        r config set lazyfree-lazy-expire yes
+        r config set lazyfree-lazy-server-del yes
+        r config set maxmemory-policy allkeys-lru
+
+        # Fill ~8MB with 80 keys of ~100KB each (using setrange).
+        # Then set maxmemory to 10MB so there is headroom but not much.
+        for {set j 0} {$j < 80} {incr j} {
+            r setrange "fill:$j" 100000 x
+        }
+        set dbsize_before [r dbsize]
+        assert_equal $dbsize_before 80
+
+        r config set maxmemory 10mb
+
+        # Create 20 large keys (large lists, >64 elements so they go through
+        # lazyfree when expired) with a very short TTL so that active expire
+        # and eviction may race.
+        for {set j 0} {$j < 20} {incr j} {
+            for {set i 0} {$i < 200} {incr i} {
+                r rpush "expkey:$j" "payload_element_$i"
+            }
+            r pexpire "expkey:$j" 500
+        }
+
+        # Wait for the keys to expire and be cleaned up.
+        wait_for_condition 100 200 {
+            [r dbsize] <= $dbsize_before
+        } else {
+            fail "expired keys were not cleaned up"
+        }
+
+        # Wait for lazyfree to drain.
+        wait_for_condition 50 100 {
+            [get_info_field [r info memory] "lazyfree_pending_bytes"] == 0
+        } else {
+            fail "lazyfree did not drain after expiry"
+        }
+
+        # Check stats consistency:
+        # evicted_keys should not exceed the total number of fill keys,
+        # because the expired keys should not have been double-counted
+        # as evicted.
+        set info [r info stats]
+        set evicted [get_info_field $info "evicted_keys"]
+        set expired [get_info_field $info "expired_keys"]
+
+        # The expired keys (20 large lists) should all have been counted
+        # as expired, not evicted.
+        assert {$expired >= 20} "expected at least 20 expired keys, got $expired"
+
+        # After draining lazyfree, memory should be within maxmemory.
+        set mem_used [get_info_field [r info memory] "used_memory"]
+        set maxmem [expr 10 * 1024 * 1024]
+        assert {$mem_used <= $maxmem} \
+            "used_memory ($mem_used) exceeds maxmemory ($maxmem) after drain"
+    }
+
+    test {concurrent eviction and active-expire do not double count stats} {
+        r flushall sync
+        r config resetstat
+
+        r config set lazyfree-lazy-eviction yes
+        r config set lazyfree-lazy-expire yes
+        r config set lazyfree-lazy-server-del yes
+        r config set maxmemory-policy allkeys-lru
+        r config set maxmemory 8mb
+
+        # Create 100 keys: 50 with TTL (candidates for active expire)
+        # and 50 without TTL (candidates for eviction).
+        # Each key is ~80KB (large enough for lazyfree).
+        for {set j 0} {$j < 50} {incr j} {
+            r setrange "volatile:$j" 80000 x
+            r pexpire "volatile:$j" 800
+        }
+        for {set j 0} {$j < 50} {incr j} {
+            r setrange "stable:$j" 80000 x
+        }
+
+        set dbsize_before [r dbsize]
+        assert_equal $dbsize_before 100
+
+        # Now shrink maxmemory to force eviction while keys are expiring.
+        r config set maxmemory 5mb
+
+        # Wait for lazyfree to drain.
+        wait_for_condition 100 200 {
+            [get_info_field [r info memory] "lazyfree_pending_bytes"] == 0
+        } else {
+            fail "lazyfree did not drain"
+        }
+
+        set info [r info stats]
+        set evicted [get_info_field $info "evicted_keys"]
+        set expired [get_info_field $info "expired_keys"]
+
+        # The total of evicted + expired should not exceed the original
+        # 100 keys (no double counting).
+        assert {$evicted + $expired <= $dbsize_before} \
+            "evicted ($evicted) + expired ($expired) > total keys ($dbsize_before)"
+
+        # The remaining keys in the DB should equal:
+        #   dbsize_before - evicted - expired
+        set remaining [r dbsize]
+        assert_equal $remaining [expr $dbsize_before - $evicted - $expired]
+    }
+
+    test {getMaxmemoryState accounts for lazyfree pending bytes} {
+        r flushall sync
+        r config set lazyfree-lazy-eviction yes
+        r config set lazyfree-lazy-expire yes
+        r config set lazyfree-lazy-server-del yes
+        r config set maxmemory-policy allkeys-lru
+        r config set maxmemory 0
+
+        # Create a few large keys (each > LAZYFREE_THRESHOLD so async free).
+        for {set j 0} {$j < 5} {incr j} {
+            for {set i 0} {$i < 200} {incr i} {
+                r rpush "big:$j" "element_$i"
+            }
+        }
+
+        # UNLINK them to send to lazyfree.
+        for {set j 0} {$j < 5} {incr j} {
+            r unlink "big:$j"
+        }
+
+        # Immediately check lazyfree_pending_bytes — should be > 0.
+        set info [r info memory]
+        set pending_bytes [get_info_field $info "lazyfree_pending_bytes"]
+        assert {$pending_bytes > 0} \
+            "expected lazyfree_pending_bytes > 0, got $pending_bytes"
+
+        # Wait for lazyfree to finish.
+        wait_for_condition 50 100 {
+            [get_info_field [r info memory] "lazyfree_pending_bytes"] == 0
+        } else {
+            fail "lazyfree did not drain"
+        }
+
+        # After drain, used_memory should be back to baseline (no large keys).
+        set mem_after [get_info_field [r info memory] "used_memory"]
+        assert {$mem_after < 2000000} \
+            "used_memory ($mem_after) still high after lazyfree drain"
+    }
+}
+

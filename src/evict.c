@@ -283,6 +283,15 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     size_t overhead = freeMemoryGetNotCountedMemory();
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
 
+    /* Subtract bytes pending in the lazyfree queue. These bytes belong to
+     * objects that have already been logically deleted from the keyspace
+     * (removed from the db hash tables) but whose physical memory has not
+     * yet been reclaimed by the bio lazyfree thread. Without this adjustment,
+     * eviction and expiry decisions would see inflated memory usage and
+     * over-evict keys when many large objects are pending async free. */
+    size_t lazyfree_bytes = lazyfreeGetPendingBytes();
+    mem_used = (mem_used > lazyfree_bytes) ? mem_used - lazyfree_bytes : 0;
+
     /* Compute the ratio of memory usage. */
     if (level) *level = (float)mem_used / (float)server.maxmemory;
 
@@ -312,6 +321,9 @@ int overMaxmemoryAfterAlloc(size_t moremem) {
 
     size_t overhead = freeMemoryGetNotCountedMemory();
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
+    /* Also subtract lazyfree pending bytes: these are logically freed. */
+    size_t lazyfree_bytes = lazyfreeGetPendingBytes();
+    mem_used = (mem_used > lazyfree_bytes) ? mem_used - lazyfree_bytes : 0;
     return mem_used + moremem > server.maxmemory;
 }
 
@@ -574,6 +586,21 @@ int performEvictions(void) {
             postExecutionUnitOperations();
             decrRefCount(keyobj);
             keys_freed++;
+
+            /* When lazyfree is used for eviction, the actual memory reclaim
+             * happens asynchronously in the bio thread. The zmalloc delta
+             * measured above only captures the dict-entry removal, not the
+             * object body which stays allocated until the bio thread frees it.
+             * To avoid over-evicting, we must check getMaxmemoryState() more
+             * frequently — it now accounts for lazyfree pending bytes, so it
+             * gives an accurate picture of whether enough memory has been
+             * logically reclaimed. */
+            if (server.lazyfree_lazy_eviction && (keys_freed % 4 == 0)) {
+                if (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_OK) {
+                    if (replicas) flushReplicasOutputBuffers();
+                    break;
+                }
+            }
 
             if (keys_freed % 16 == 0) {
                 /* When the memory to free starts to be big enough, we may

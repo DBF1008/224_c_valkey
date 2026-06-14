@@ -8,14 +8,23 @@
 
 static _Atomic size_t lazyfree_objects = 0;
 static _Atomic size_t lazyfreed_objects = 0;
+/* Tracks the total zmalloc-allocated bytes of objects currently pending
+ * in the lazyfree queue. This counter is updated in the main thread when
+ * an object is enqueued, and decremented in the bio thread when the
+ * object is actually freed. It is used by getMaxmemoryState() to give
+ * eviction/expiry decisions a more accurate view of reclaimable memory,
+ * preventing over-eviction when many large keys are pending async free. */
+static _Atomic size_t lazyfree_pending_bytes = 0;
 
 /* Release objects from the lazyfree thread. It's just decrRefCount()
  * updating the count of objects to release. */
 void lazyfreeFreeObject(void *args[]) {
     robj *o = (robj *)args[0];
+    size_t obj_size = zmalloc_size(o);
     decrRefCount(o);
     atomic_fetch_sub_explicit(&lazyfree_objects, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&lazyfreed_objects, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&lazyfree_pending_bytes, obj_size, memory_order_relaxed);
 }
 
 /* Release a database from the lazyfree thread. The 'db' pointer is the
@@ -115,6 +124,14 @@ size_t lazyfreeGetFreedObjectsCount(void) {
     return aux;
 }
 
+/* Return the total zmalloc-allocated bytes of objects currently pending
+ * in the lazyfree queue. Used by getMaxmemoryState() to account for
+ * memory that is logically reclaimed but physically still allocated. */
+size_t lazyfreeGetPendingBytes(void) {
+    size_t aux = atomic_load_explicit(&lazyfree_pending_bytes, memory_order_relaxed);
+    return aux;
+}
+
 void lazyfreeResetStats(void) {
     atomic_store_explicit(&lazyfreed_objects, 0, memory_order_relaxed);
 }
@@ -196,7 +213,9 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
      * of parts of the server core may call incrRefCount() to protect
      * objects, and then call dbDelete(). */
     if (free_effort > LAZYFREE_THRESHOLD && obj->refcount == 1) {
+        size_t obj_size = zmalloc_size(obj);
         atomic_fetch_add_explicit(&lazyfree_objects, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&lazyfree_pending_bytes, obj_size, memory_order_relaxed);
         bioCreateLazyFreeJob(lazyfreeFreeObject, 1, obj);
     } else {
         decrRefCount(obj);
