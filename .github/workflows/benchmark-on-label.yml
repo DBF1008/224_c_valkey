@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 7200
     steps:
       - name: Checkout valkey
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           path: valkey
           fetch-depth: 0
@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout valkey-perf-benchmark
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: ${{ github.repository_owner }}/valkey-perf-benchmark
           path: valkey-perf-benchmark
@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout valkey for latest benchmark.
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: valkey-io/valkey
           ref: "unstable"
