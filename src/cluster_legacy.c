@@ -2356,47 +2356,45 @@ uint64_t clusterGetMaxEpoch(void) {
     return max;
 }
 
-/* If this node epoch is zero or is not already the greatest across the
- * cluster (from the POV of the local configuration), this function will:
+/* Unconditionally generate a new config epoch for this node, WITHOUT
+ * any consensus. The function always succeeds: it guarantees the new
+ * configEpoch is strictly greater than every known epoch in the cluster
+ * (by advancing currentEpoch past clusterGetMaxEpoch() when needed).
  *
- * 1) Generate a new config epoch, incrementing the current epoch.
- * 2) Assign the new epoch to this node, WITHOUT any consensus.
- * 3) Persist the configuration on disk before sending packets with the
- *    new configuration.
+ * The new epoch is persisted to disk and broadcast to all nodes before
+ * this function returns (via clusterDoBeforeSleep).
  *
- * If the new config epoch is generated and assigned, C_OK is returned,
- * otherwise C_ERR is returned (since the node has already the greatest
- * configuration around) and no operation is performed.
- *
- * Important note: this function violates the principle that config epochs
- * should be generated with consensus and should be unique across the cluster.
- * However the cluster uses this auto-generated new config epochs in two
- * cases:
+ * This function is used in three scenarios:
  *
  * 1) When slots are closed after importing. Otherwise resharding would be
- *    too expensive.
+ *    too expensive, requiring a full consensus round for each slot.
  * 2) When CLUSTER FAILOVER is called with options that force a replica to
- *    failover its primary even if there is not primary majority able to
+ *    failover its primary even if there is no primary majority able to
  *    create a new configuration epoch.
+ * 3) During failover slot transfer, to ensure the new primary has a fresh
+ *    epoch that is higher than any previously seen epoch, so that its slot
+ *    ownership claims are accepted by all other nodes.
  *
- * The cluster will not explode using this function, even in the case of
- * a collision between this node and another node, generating the same
- * configuration epoch unilaterally, because the config epoch conflict
- * resolution algorithm will eventually move colliding nodes to different
- * config epochs. However using this function may violate the "last failover
- * wins" rule, so should only be used with care. */
+ * Safety: if this function produces an epoch that collides with another
+ * node's epoch (which can happen due to races between unilateral bumps),
+ * the config epoch conflict resolution algorithm (clusterHandleConfigEpoch-
+ * Collision) will deterministically resolve the collision by having the
+ * node with the lexicographically smaller Node ID bump again. */
 int clusterBumpConfigEpochWithoutConsensus(void) {
     uint64_t maxEpoch = clusterGetMaxEpoch();
 
-    if (myself->configEpoch == 0 || myself->configEpoch != maxEpoch) {
-        server.cluster->currentEpoch++;
-        myself->configEpoch = server.cluster->currentEpoch;
-        clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
-        serverLog(LL_NOTICE, "New configEpoch set to %llu", (unsigned long long)myself->configEpoch);
-        return C_OK;
-    } else {
-        return C_ERR;
+    /* Ensure currentEpoch is at least as large as the greatest known epoch,
+     * so that the increment below produces a strictly greater value. This
+     * is essential when the node already holds the highest epoch (e.g. after
+     * a failover) and needs to bump again for a slot import finalization. */
+    if (server.cluster->currentEpoch < maxEpoch) {
+        server.cluster->currentEpoch = maxEpoch;
     }
+    server.cluster->currentEpoch++;
+    myself->configEpoch = server.cluster->currentEpoch;
+    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
+    serverLog(LL_NOTICE, "New configEpoch set to %llu", (unsigned long long)myself->configEpoch);
+    return C_OK;
 }
 
 /* This function is called when this node is a primary, and we receive from
@@ -5550,8 +5548,19 @@ void clusterLogCantFailover(int reason) {
  * where the replica grabs its primary's hash slots, and propagates the new
  * configuration.
  *
- * Note that it's up to the caller to be sure that the node got a new
- * configuration epoch already. */
+ * The function bumps a new config epoch (via clusterBumpConfigEpochWithout-
+ * Consensus) to ensure the new slot ownership is accepted by all other nodes.
+ * This makes the function self-contained: callers do not need to manage the
+ * epoch before calling. The epoch bump is guaranteed to produce a value
+ * strictly greater than any previously known epoch, so that the slot
+ * ownership claim wins any comparison in clusterUpdateSlotsConfigWith().
+ *
+ * The entire sequence — epoch bump, role change, slot transfer, state update,
+ * config save, and broadcast — executes atomically within a single event-loop
+ * iteration (before clusterBeforeSleep processes any broadcasts). Other nodes
+ * will therefore first see the new state when the broadcast PONG is sent, at
+ * which point all local fields (configEpoch, slot bitmap, node role) are
+ * already consistent. */
 void clusterFailoverReplaceYourPrimary(void) {
     clusterNode *old_primary = myself->replicaof;
 
@@ -5560,11 +5569,15 @@ void clusterFailoverReplaceYourPrimary(void) {
     serverLog(LL_NOTICE, "Setting myself to primary in shard %.40s after failover; my old primary is %.40s (%s)",
               myself->shard_id, old_primary->name, humanNodename(old_primary));
 
-    /* 1) Turn this node into a primary. */
+    /* 1) Bump the config epoch so that the new slot ownership is accepted
+     *    by all other nodes. This always succeeds. */
+    clusterBumpConfigEpochWithoutConsensus();
+
+    /* 2) Turn this node into a primary. */
     clusterSetNodeAsPrimary(myself);
 
     int remaining = old_primary->numslots;
-    /* 2) Claim all the slots assigned to our primary. */
+    /* 3) Claim all the slots assigned to our primary. */
     for (unsigned long byte = 0; byte < sizeof(old_primary->slots) && remaining > 0; ++byte) {
         unsigned char bits = old_primary->slots[byte];
         while (bits) {
@@ -5577,18 +5590,18 @@ void clusterFailoverReplaceYourPrimary(void) {
         }
     }
 
-    /* 3) Update state, note that we do not use CLUSTER_TODO_UPDATE_STATE since we want the node
+    /* 4) Update state, note that we do not use CLUSTER_TODO_UPDATE_STATE since we want the node
      * to update the cluster state ASAP after failover. */
     clusterUpdateState();
 
-    /* 4) Save and fsync the config, and pong all the other nodes so that they can update the state
+    /* 5) Save and fsync the config, and pong all the other nodes so that they can update the state
      *    accordingly and detect that we switched to primary role. */
     clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
 
-    /* 5) If there was a manual failover in progress, clear the state. */
+    /* 6) If there was a manual failover in progress, clear the state. */
     resetManualFailover();
 
-    /* 6) Upon becoming primary, we need to ensure that data is deleted in unowned slots. */
+    /* 7) Upon becoming primary, we need to ensure that data is deleted in unowned slots. */
     verifyClusterConfigWithData();
 
     /* Since we have became a new primary node, we may rely on auth_time to
@@ -7899,14 +7912,12 @@ void clusterCommandSetSlot(client *c) {
                  * to a new epoch so that the new version can be propagated
                  * by the cluster.
                  *
-                 * Note that if this ever results in a collision with another
-                 * node getting the same configEpoch, for example because a
-                 * failover happens at the same time we close the slot, the
-                 * configEpoch collision resolution will fix it assigning
-                 * a different epoch to each node. */
-                if (clusterBumpConfigEpochWithoutConsensus() == C_OK) {
-                    serverLog(LL_NOTICE, "ConfigEpoch updated after importing slot %d", slot);
-                }
+                 * If this results in a collision with another node getting
+                 * the same configEpoch (e.g. because a failover happens at
+                 * the same time we close the slot), the configEpoch collision
+                 * resolution will fix it by assigning a different epoch. */
+                clusterBumpConfigEpochWithoutConsensus();
+                serverLog(LL_NOTICE, "ConfigEpoch updated after importing slot %d", slot);
                 /* After importing this slot, let the other nodes know as
                  * soon as possible. */
                 clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
@@ -8039,8 +8050,8 @@ int clusterCommandSpecial(client *c) {
         clusterCommandSetSlot(c);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "bumpepoch") && c->argc == 2) {
         /* CLUSTER BUMPEPOCH */
-        int retval = clusterBumpConfigEpochWithoutConsensus();
-        sds reply = sdscatfmt(sdsempty(), "+%s %U\r\n", (retval == C_OK) ? "BUMPED" : "STILL",
+        clusterBumpConfigEpochWithoutConsensus();
+        sds reply = sdscatfmt(sdsempty(), "+BUMPED %U\r\n",
                               (unsigned long long)myself->configEpoch);
         addReplySds(c, reply);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "saveconfig") && c->argc == 2) {
@@ -8206,12 +8217,11 @@ int clusterCommandSpecial(client *c) {
         sds client = catClientInfoShortString(sdsempty(), c, server.hide_user_data_from_log);
 
         if (takeover) {
-            /* A takeover does not perform any initial check. It just
-             * generates a new configuration epoch for this node without
-             * consensus, claims the primary's slots, and broadcast the new
-             * configuration. */
+            /* A takeover does not perform any initial check. It claims the
+             * primary's slots (bumping a new configuration epoch without
+             * consensus) and broadcasts the new configuration. The epoch
+             * bump is handled inside clusterFailoverReplaceYourPrimary(). */
             serverLog(LL_NOTICE, "Taking over the primary (user request from '%s').", client);
-            clusterBumpConfigEpochWithoutConsensus();
             clusterFailoverReplaceYourPrimary();
         } else if (force) {
             /* If this is a forced failover, we don't need to talk with our

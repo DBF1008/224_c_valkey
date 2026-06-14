@@ -846,10 +846,17 @@ slotMigrationJob *createSlotImportJob(client *c,
 
 /* This function implements the final part of manual slot failovers,
  * where the target takes over all the slot migration job's hash slots, and
- * propagates the new configuration. */
+ * propagates the new configuration.
+ *
+ * The sequence — epoch bump, slot transfer, state update, config save, and
+ * broadcast — executes atomically within a single event-loop iteration.
+ * clusterBumpConfigEpochWithoutConsensus() is guaranteed to succeed, so the
+ * new slot ownership claims will always carry a strictly higher epoch than
+ * any previously known epoch. */
 void performSlotImportJobFailover(slotMigrationJob *job) {
     serverAssert(job->type == SLOT_MIGRATION_IMPORT);
-    /* 1) Force bump the epoch to facilitate propagation. */
+    /* 1) Bump the config epoch so the new slot ownership is accepted by all
+     *    other nodes. This always succeeds. */
     clusterBumpConfigEpochWithoutConsensus();
 
     /* 2) Claim all the slots in the slot migration job to myself. */
@@ -864,14 +871,12 @@ void performSlotImportJobFailover(slotMigrationJob *job) {
         }
     }
 
-    /* 3) Update state and save config. */
-    clearCachedClusterSlotsResponse();
+    /* 3) Update state, save config, and broadcast to all other nodes so that
+     *    they can update the state accordingly and detect that we have taken
+     *    over the slots. The CLUSTER_TODO_SAVE_CONFIG flag also clears the
+     *    cached CLUSTER SLOTS response (via clusterDoBeforeSleep). */
     clusterUpdateState();
-    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG);
-
-    /* 4) Pong all the other nodes so that they can update the state accordingly
-     *    and detect that we have taken over the slots. */
-    clusterDoBeforeSleep(CLUSTER_TODO_BROADCAST_ALL);
+    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG | CLUSTER_TODO_BROADCAST_ALL);
 }
 
 bool clusterIsAnySlotImporting(void) {
