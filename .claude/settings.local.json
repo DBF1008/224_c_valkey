@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -i 's/\\\\r$//' tests/integration/psync-backlog-boundary.tcl)",
+      "Bash(./runtest --single integration/psync-backlog-boundary --timeout 300)"
+    ]
+  }
+}

@@ -786,15 +786,48 @@ long long addReplyReplicationBacklog(client *c, long long offset) {
         if (o->repl_offset + (long long)o->used >= offset) break;
         node = listNextNode(node);
     }
-    serverAssert(node != NULL);
 
     /* Install a writer handler first.*/
     prepareClientToWrite(c);
-    /* Setting output buffer of the replica. */
-    replBufBlock *o = listNodeValue(node);
-    o->refcount++;
-    c->repl_data->ref_repl_buf_node = node;
-    c->repl_data->ref_block_pos = offset - o->repl_offset;
+
+    if (node != NULL) {
+        /* Normal case: the requested offset falls within a specific backlog
+         * block. Point the replica at that block so it replays the missing
+         * portion of the replication stream. */
+        replBufBlock *o = listNodeValue(node);
+        o->refcount++;
+        c->repl_data->ref_repl_buf_node = node;
+        c->repl_data->ref_block_pos = offset - o->repl_offset;
+    } else {
+        /* Edge case: the replica is already fully caught up, i.e. its
+         * requested offset equals backlog->offset + backlog->histlen, which
+         * is one past the last byte stored in the backlog.  The linear scan
+         * walked past every block and returned NULL because no block covers
+         * that position.
+         *
+         * This can legitimately happen when:
+         *  - The replica was connected, received all data, then briefly
+         *    disconnected (e.g. network blip) and re-PSYNCs before any new
+         *    commands were propagated.
+         *  - The backlog was just recreated and the first data has been fed,
+         *    but the replica's offset already matches the new backlog end.
+         *
+         * Position the replica at the very end of the last replication buffer
+         * block so that when feedReplicationBuffer() appends new data (either
+         * extending this block or creating the next one), the replica will
+         * start reading from exactly the right position. */
+        serverAssert(server.repl_backlog->histlen > 0);
+        listNode *last = listLast(server.repl_buffer_blocks);
+        serverAssert(last != NULL);
+        replBufBlock *o = listNodeValue(last);
+        o->refcount++;
+        c->repl_data->ref_repl_buf_node = last;
+        c->repl_data->ref_block_pos = o->used;
+        serverLog(LL_DEBUG,
+                  "[PSYNC] Replica is caught up at offset %lld, "
+                  "positioned at end of last backlog block (block offset %lld, used %zu).",
+                  offset, o->repl_offset, o->used);
+    }
 
     return server.repl_backlog->histlen - skip;
 }
@@ -886,6 +919,22 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
         goto need_full_resync;
     }
 
+    /* Catch an impossible offset: the replica claims to have received more
+     * data than this primary has ever produced.  This should never happen in
+     * correct operation; if it does, something is seriously wrong with the
+     * replica state or the primary_repl_offset accounting.  Reject outright
+     * instead of proceeding to a potentially corrupted partial resync. */
+    if (psync_offset > server.primary_repl_offset + 1) {
+        serverLog(LL_WARNING,
+                  "Partial resynchronization not accepted: "
+                  "replica %s claims offset %lld which is beyond the primary "
+                  "replication offset %lld (replid '%s', my IDs: '%s'/'%s').",
+                  replicationGetReplicaName(c), psync_offset,
+                  server.primary_repl_offset, primary_replid,
+                  server.replid, server.replid2);
+        goto need_full_resync;
+    }
+
     /* We still have the data our replica is asking for? */
     if (!server.repl_backlog || psync_offset < server.repl_backlog->offset ||
         psync_offset > (server.repl_backlog->offset + server.repl_backlog->histlen)) {
@@ -908,6 +957,12 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
         }
         goto need_full_resync;
     }
+
+    /* Invariant: the backlog window must be consistent with the primary
+     * replication offset.  A violation here indicates a bookkeeping bug. */
+    serverAssert(server.repl_backlog->offset <= server.primary_repl_offset + 1);
+    serverAssert(server.repl_backlog->offset + server.repl_backlog->histlen <=
+                 server.primary_repl_offset + 1);
 
     /* There are two scenarios that lead to this point. One is that we are able
      * to perform a partial resync with the replica. The second is that the replica
