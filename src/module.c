@@ -1423,6 +1423,10 @@ int VM_CreateCommand(ValkeyModuleCtx *ctx,
     cp->serverCmd->id = ACLGetCommandID(declared_name); /* ID used for ACL. */
     /* Invalidate COMMAND response cache since we added a new command */
     invalidateCommandCache();
+    /* Invalidate cached command lookups in all client command queues.
+     * This ensures any cached "command not found" results are cleared,
+     * allowing clients to use the newly registered command. */
+    invalidateAllClientsCommandCache();
     return VALKEYMODULE_OK;
 }
 
@@ -13266,6 +13270,9 @@ void moduleUnregisterCommands(struct ValkeyModule *module) {
     hashtableCleanupIterator(&iter);
     /* Invalidate COMMAND response cache since we removed commands */
     invalidateCommandCache();
+    /* Invalidate cached command lookups in all client command queues to prevent
+     * use-after-free since we just freed command structures. */
+    invalidateAllClientsCommandCache();
 }
 
 /* We parse argv to add sds "NAME VALUE" pairs to the server.module_configs_queue list of configs.

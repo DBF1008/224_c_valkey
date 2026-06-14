@@ -2916,6 +2916,8 @@ void clearClientConnectionState(client *c);
 void resetClient(client *c);
 void resetClientIOState(client *c);
 void discardCommandQueue(client *c);
+void invalidateClientCommandCache(client *c);
+void invalidateAllClientsCommandCache(void);
 void freeClientOriginalArgv(client *c);
 void freeClientArgv(client *c);
 void sendReplyToClient(connection *conn);

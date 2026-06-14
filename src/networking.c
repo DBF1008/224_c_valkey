@@ -4068,6 +4068,47 @@ void discardCommandQueue(client *c) {
     queue->off = queue->len = queue->cap = 0;
 }
 
+/* Invalidate the cached command lookup for a client's current command and
+ * all queued commands. This is necessary when the command table changes
+ * (e.g., module commands are loaded/unloaded) to prevent use-after-free
+ * or stale command metadata. */
+void invalidateClientCommandCache(client *c) {
+    /* Invalidate the current parsed command */
+    c->parsed_cmd = NULL;
+    c->read_flags &= ~(READ_FLAGS_COMMAND_NOT_FOUND |
+                       READ_FLAGS_BAD_ARITY |
+                       READ_FLAGS_CROSSSLOT |
+                       READ_FLAGS_NO_KEYS |
+                       READ_FLAGS_PREFETCHED);
+    c->slot = -1;
+
+    /* Invalidate all commands in the queue */
+    cmdQueue *queue = &c->cmd_queue;
+    for (int i = queue->off; i < queue->len; i++) {
+        parsedCommand *p = &queue->cmds[i];
+        p->cmd = NULL;
+        p->read_flags &= ~(READ_FLAGS_COMMAND_NOT_FOUND |
+                           READ_FLAGS_BAD_ARITY |
+                           READ_FLAGS_CROSSSLOT |
+                           READ_FLAGS_NO_KEYS |
+                           READ_FLAGS_PREFETCHED);
+        p->slot = -1;
+    }
+}
+
+/* Iterate over all clients and invalidate their command caches. This should
+ * be called when the command table changes (e.g., module commands are
+ * registered/unregistered) to ensure no client has stale command pointers. */
+void invalidateAllClientsCommandCache(void) {
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        invalidateClientCommandCache(c);
+    }
+}
+
 /* Returns the number of keys in the the incr_states array after adding keys. */
 static int addKeysToIncrFindBatch(client *c,
                                   struct serverCommand *cmd,
