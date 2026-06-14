@@ -3071,7 +3071,6 @@ void enableTracking(client *c, uint64_t redirect_to, struct ClientFlags options,
 void disableTracking(client *c);
 void trackingRememberKeys(client *tracking, client *executing);
 void trackingInvalidateKey(client *c, robj *keyobj, int bcast);
-void trackingScheduleKeyInvalidation(uint64_t client_id, robj *keyobj);
 void trackingHandlePendingKeyInvalidations(void);
 void trackingInvalidateKeysOnFlush(int async);
 void freeTrackingRadixTree(rax *rt);

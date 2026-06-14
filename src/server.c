@@ -1931,9 +1931,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * our clients. */
     updateFailoverStatus();
 
-    /* Since we rely on current_client to send scheduled invalidation messages
-     * we have to flush them after each command, so when we get here, the list
-     * must be empty. */
+    /* Scheduled tracking invalidation messages are flushed after every
+     * top-level command, and each one is delivered to the specific client it
+     * was scheduled for, so when we get here the list must be empty. */
     serverAssert(listLength(server.tracking_pending_keys) == 0);
     serverAssert(listLength(server.pending_push_messages) == 0);
 

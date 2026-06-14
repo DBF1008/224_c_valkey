@@ -914,6 +914,85 @@ start_server {tags {"tracking network logreqres:skip"}} {
         assert_equal {PONG} [$rd read]
     }
 
+    # The following tests verify that, when a tracking client modifies its own
+    # tracked keys inside an execution unit (MULTI/EXEC, Lua script or a single
+    # multi-key command), the invalidation messages are aligned with the commit
+    # point of that unit: each affected key is invalidated exactly once and only
+    # after the unit's reply, with no message folded away or dropped. A sentinel
+    # key is invalidated right after the unit as a fence: it must be the very
+    # next message, proving no duplicate/leftover invalidation was queued before.
+    test {Tracking: same key modified multiple times in MULTI/EXEC yields one invalidation} {
+        clean_all
+        r CLIENT TRACKING on REDIRECT $redir_id
+        # Register interest in the target key and a sentinel key.
+        r MGET dk{t} sentinel{t}
+        r MULTI
+        r SET dk{t} 1
+        r SET dk{t} 2
+        r DEL dk{t}
+        r EXEC
+        # Exactly one invalidation for dk{t} should be delivered for the unit.
+        set keys [lindex [$rd_redirection read] 2]
+        assert_equal 1 [llength $keys]
+        assert_equal {dk{t}} [lindex $keys 0]
+        # Fence: the sentinel invalidation must be the next message.
+        r INCR sentinel{t}
+        set keys [lindex [$rd_redirection read] 2]
+        assert_equal {sentinel{t}} [lindex $keys 0]
+    }
+
+    test {Tracking: distinct keys modified in MULTI/EXEC are each invalidated once} {
+        clean_all
+        r CLIENT TRACKING on REDIRECT $redir_id
+        r MGET k1{t} k2{t} k3{t} sentinel{t}
+        r MULTI
+        r INCR k1{t}
+        r INCR k2{t}
+        r INCR k3{t}
+        r EXEC
+        # Default tracking sends one message per invalidated key.
+        set got {}
+        for {set i 0} {$i < 3} {incr i} {
+            set keys [lindex [$rd_redirection read] 2]
+            assert_equal 1 [llength $keys]
+            lappend got [lindex $keys 0]
+        }
+        assert_equal {k1{t} k2{t} k3{t}} [lsort $got]
+        # Fence: no extra/duplicate invalidation precedes the sentinel.
+        r INCR sentinel{t}
+        assert_equal {sentinel{t}} [lindex [$rd_redirection read] 2]
+    }
+
+    test {Tracking: invalidations from a Lua script are delivered once after the script} {
+        clean_all
+        r CLIENT TRACKING on REDIRECT $redir_id
+        r MGET lk{t} sentinel{t}
+        # The script touches the same key several times; only a single
+        # invalidation must be produced, and only after the script finishes.
+        r EVAL {redis.call('set', KEYS[1], '1'); redis.call('set', KEYS[1], '2'); redis.call('incr', KEYS[1]); return 'ok'} 1 lk{t}
+        set keys [lindex [$rd_redirection read] 2]
+        assert_equal 1 [llength $keys]
+        assert_equal {lk{t}} [lindex $keys 0]
+        r INCR sentinel{t}
+        assert_equal {sentinel{t}} [lindex [$rd_redirection read] 2]
+    }
+
+    test {Tracking: a single MSET batch invalidates every modified key once} {
+        clean_all
+        r CLIENT TRACKING on REDIRECT $redir_id
+        r MGET p1{t} p2{t} p3{t} p4{t} sentinel{t}
+        r MSET p1{t} 1 p2{t} 1 p3{t} 1 p4{t} 1
+        set got {}
+        for {set i 0} {$i < 4} {incr i} {
+            set keys [lindex [$rd_redirection read] 2]
+            assert_equal 1 [llength $keys]
+            lappend got [lindex $keys 0]
+        }
+        assert_equal {p1{t} p2{t} p3{t} p4{t}} [lsort $got]
+        r INCR sentinel{t}
+        assert_equal {sentinel{t}} [lindex [$rd_redirection read] 2]
+    }
+
     $rd_redirection close
     $rd_sg close
     $rd close

@@ -58,6 +58,34 @@ typedef struct bcastState {
                      prefix. */
 } bcastState;
 
+/* An invalidation message that has been scheduled to be delivered once the
+ * command (and the whole execution unit) that generated it has finished, so
+ * that the message is not interleaved with the command reply.
+ *
+ * We remember the *target* client by id rather than relying on
+ * server.current_client at flush time: the flush can run in a different client
+ * context than the one the invalidation was generated for (for instance when a
+ * command runs nested inside another client's execution unit), and routing to
+ * server.current_client in that case would deliver the message to the wrong
+ * client and drop it for the intended one. Looking the client up by id also
+ * lets us safely skip clients that were freed before the flush. */
+typedef struct trackingPendingInvalidation {
+    uint64_t client_id; /* Client that should receive the invalidation. */
+    robj *keyobj;       /* Key to invalidate, or NULL meaning "all keys". */
+} trackingPendingInvalidation;
+
+/* Schedule an invalidation message targeting 'client_id'. 'keyobj' is the key
+ * to invalidate, or NULL to signal that all keys are now invalid (used after a
+ * flush). A reference to 'keyobj' is taken and released when the pending list
+ * is flushed in trackingHandlePendingKeyInvalidations(). */
+static void trackingScheduleInvalidation(uint64_t client_id, robj *keyobj) {
+    trackingPendingInvalidation *pi = zmalloc(sizeof(*pi));
+    pi->client_id = client_id;
+    pi->keyobj = keyobj;
+    if (keyobj) incrRefCount(keyobj);
+    listAddNodeTail(server.tracking_pending_keys, pi);
+}
+
 /* Remove the tracking state from the client 'c'. Note that there is not much
  * to do for us here, if not to decrement the counter of the clients in
  * tracking mode, because we just store the ID of the client in the tracking
@@ -404,12 +432,14 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
             continue;
         }
 
-        /* If target is current client and it's executing a command, we need schedule key invalidation.
-         * As the invalidation messages may be interleaved with command
-         * response and should after command response. */
+        /* If target is current client and it's executing a command, we need to
+         * schedule the key invalidation, as the invalidation message must not be
+         * interleaved with the command response and should be sent after it.
+         * The message is remembered for 'target' specifically (by id) so that it
+         * is delivered to the right client even if server.current_client changes
+         * before the pending list is flushed (e.g. nested execution units). */
         if (target == server.current_client && (server.current_client->flag.executing_command)) {
-            incrRefCount(keyobj);
-            listAddNodeTail(server.tracking_pending_keys, keyobj);
+            trackingScheduleInvalidation(target->id, keyobj);
         } else {
             sendTrackingMessage(target, (char *)objectGetVal(keyobj), sdslen(objectGetVal(keyobj)), 0);
         }
@@ -426,8 +456,8 @@ void trackingInvalidateKey(client *c, robj *keyobj, int bcast) {
 void trackingHandlePendingKeyInvalidations(void) {
     if (!listLength(server.tracking_pending_keys)) return;
 
-    /* Flush pending invalidation messages only when we are not in nested call.
-     * So the messages are not interleaved with transaction response. */
+    /* Flush pending invalidation messages only when we are not in a nested call.
+     * So the messages are not interleaved with the transaction / script response. */
     if (server.execution_nesting) return;
 
     listNode *ln;
@@ -435,18 +465,24 @@ void trackingHandlePendingKeyInvalidations(void) {
 
     listRewind(server.tracking_pending_keys, &li);
     while ((ln = listNext(&li)) != NULL) {
-        robj *key = listNodeValue(ln);
-        /* current_client maybe freed, so we need to send invalidation
-         * message only when current_client is still alive */
-        if (server.current_client != NULL) {
+        trackingPendingInvalidation *pi = listNodeValue(ln);
+        robj *key = pi->keyobj;
+        /* Deliver the invalidation to the client it was actually scheduled for.
+         * This may not be server.current_client (the key could have been
+         * modified by a command running nested inside another client's
+         * execution unit), and the target may have been freed in the meantime,
+         * so we look it up by id and skip delivery if it no longer exists. */
+        client *target = lookupClientByID(pi->client_id);
+        if (target != NULL) {
             if (key != NULL) {
-                sendTrackingMessage(server.current_client, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
+                sendTrackingMessage(target, (char *)objectGetVal(key), sdslen(objectGetVal(key)), 0);
             } else {
-                sendTrackingMessage(server.current_client, objectGetVal(shared.null[server.current_client->resp]),
-                                    sdslen(objectGetVal(shared.null[server.current_client->resp])), 1);
+                sendTrackingMessage(target, objectGetVal(shared.null[target->resp]),
+                                    sdslen(objectGetVal(shared.null[target->resp])), 1);
             }
         }
         if (key != NULL) decrRefCount(key);
+        zfree(pi);
     }
     listEmpty(server.tracking_pending_keys);
 }
@@ -476,8 +512,9 @@ void trackingInvalidateKeysOnFlush(int async) {
             client *c = listNodeValue(ln);
             if (c->flag.tracking) {
                 if (c == server.current_client) {
-                    /* We use a special NULL to indicate that we should send null */
-                    listAddNodeTail(server.tracking_pending_keys, NULL);
+                    /* Schedule a NULL key to indicate that all keys are now
+                     * invalid, to be delivered after the current command. */
+                    trackingScheduleInvalidation(c->id, NULL);
                 } else {
                     sendTrackingMessage(c, objectGetVal(shared.null[c->resp]), sdslen(objectGetVal(shared.null[c->resp])), 1);
                 }
